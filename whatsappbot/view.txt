@@ -1,0 +1,113 @@
+from django.http import JsonResponse, HttpResponseForbidden, HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+import json
+from .send_api import send_text_message
+from bot.models import *
+
+USER_ROLES = {
+    "263780200374": "staff",
+    "263777111222": "parent"
+}
+
+FEES_BALANCE = {
+    "263780200374": "USD 0.00",
+    "263777111222": "USD 150.00"
+}
+
+BANK_DETAILS = "Bank: ABC Bank\nAccount: 1234567890\nBranch: Harare"
+
+VERIFY_TOKEN = "my_secure_verify_token_123"
+
+
+USER_STATES = {}
+
+
+@csrf_exempt
+def webhook(request):
+    if request.method == "GET":
+        mode = request.GET.get("hub.mode")
+        token = request.GET.get("hub.verify_token")
+        challenge = request.GET.get("hub.challenge")
+        
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            # print("Webhook verified successfully!")
+            return HttpResponse(challenge)
+        else:
+            # print(f"Webhook verification failed: {token}")
+            return HttpResponseForbidden("Verification token mismatch")
+
+    elif request.method == "POST":
+        try:
+            data = json.loads(request.body)
+            # print("Incoming webhook data:", json.dumps(data, indent=2))
+            
+            message_obj = data['entry'][0]['changes'][0]['value']['messages'][0]
+            phone = message_obj['from']
+            role = USER_ROLES.get(phone, "parent")
+            
+            if message_obj.get('type') == 'text':
+                text = message_obj['text']['body'].strip().lower()
+                state = USER_STATES.get(phone)
+
+                if not state:
+                    # First interaction, greet and ask to reply 1 to continue
+                    USER_STATES[phone] = "waiting_confirmation"
+                    send_text_message(phone,
+                        "👋 Welcome to the School Fees Bot!\nWould you like to continue?\n👉 Reply with 1 to proceed."
+                    )
+                elif state == "waiting_confirmation":
+                    if text == "1":
+                        USER_STATES[phone] = "main_menu"
+                        send_text_message(phone, get_main_menu(role))
+                    else:
+                        send_text_message(phone, "❓ Please reply with 1 to continue.")
+                elif state == "main_menu":
+                    response = handle_menu_selection(role, text, phone)
+                    send_text_message(phone, response)
+                else:
+                    # Reset flow if unknown state
+                    USER_STATES.pop(phone, None)
+                    send_text_message(phone, "Session reset. Please send any message to start again.")
+        except Exception as e:
+            print("Error handling webhook POST:", e)
+
+        return JsonResponse({"status": "received"}, status=200)
+
+
+def get_main_menu(role):
+    if role == "staff":
+        return (
+            "👨‍🏫 Staff Menu:\n"
+            "1. View fees balance\n"
+            "2. Get statement PDF\n"
+            "3. Bank account details\n"
+            "4. Debtors listing PDF\n"
+            "5. View announcements"
+        )
+    else:
+        return (
+            "👨‍👩‍👧 Parent Menu:\n"
+            "1. View fees balance\n"
+            "2. Get statement PDF\n"
+            "3. Bank account details"
+        )
+
+
+def handle_menu_selection(role, message, phone):
+    if message == "1":
+        return f"💰 Your fees balance is: {FEES_BALANCE.get(phone, 'Not available')}"
+
+    elif message == "2":
+        return "📄 Statement PDF: https://statement.com/statement.pdf"
+
+    elif message == "3":
+        return BANK_DETAILS
+
+    elif message == "4" and role == "staff":
+        return "📄 Debtors PDF: https://debtor.com/debtors.pdf"
+
+    elif message == "5" and role == "staff":
+        return "📢 Announcement: School reopens on Monday."
+
+    else:
+        return "❓ Invalid selection. Please choose a number from the menu."

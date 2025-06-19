@@ -1,0 +1,153 @@
+from django.http import JsonResponse, HttpResponseForbidden, HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+import json
+from .send_api import send_text_message
+from bot.models import lbt_customer, account_balances, lbt_stuff
+
+BANK_DETAILS = "🏦 Bank: ABC Bank\n💳 Account: 1234567890\n🏢 Branch: Masvingo"
+VERIFY_TOKEN = "my_secure_verify_token_123"
+USER_STATES = {}  # Stores conversation state per user
+TEMP_DATA = {}    # Temporarily stores inputs like reg number for staff queries
+
+@csrf_exempt
+def webhook(request):
+    if request.method == "GET":
+        mode = request.GET.get("hub.mode")
+        token = request.GET.get("hub.verify_token")
+        challenge = request.GET.get("hub.challenge")
+
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            return HttpResponse(challenge)
+        else:
+            return HttpResponseForbidden("Verification token mismatch")
+
+    elif request.method == "POST":
+        try:
+            data = json.loads(request.body)
+            message_obj = data['entry'][0]['changes'][0]['value']['messages'][0]
+            phone = message_obj['from']
+            message_type = message_obj.get('type')
+            text = message_obj['text']['body'].strip() if message_type == 'text' else ''
+            state = USER_STATES.get(phone)
+
+            # Determine role
+            is_staff = lbt_stuff.objects.filter(col_stuff_mobi_num=phone).exists()
+            is_parent = lbt_customer.objects.filter(col_mobi_num=phone).exists()
+
+            if is_staff:
+                role = "staff"
+            elif is_parent:
+                role = "parent"
+            else:
+                send_text_message(phone, "❌ Your number is not recognized. Please contact the school office.")
+                return JsonResponse({"status": "not recognized"}, status=200)
+
+            # Handle states
+            if not state:
+                USER_STATES[phone] = "waiting_confirmation"
+                send_text_message(phone,
+                    "👋 Welcome to BeezBot!\n👉 Reply with 1 to Proceed."
+                )
+
+            elif state == "waiting_confirmation":
+                if text == "1":
+                    USER_STATES[phone] = "main_menu"
+                    send_text_message(phone, get_main_menu(role))
+                else:
+                    send_text_message(phone, "❓ Please reply with 1 to continue.")
+
+            elif state == "main_menu":
+                if text == "1" and role == "staff":
+                    USER_STATES[phone] = "awaiting_student_reg"
+                    send_text_message(phone, "📝 Please enter the Student's RGISTRATION NUMBER")
+                else:
+                    response = handle_menu_selection(role, text, phone)
+                    send_text_message(phone, response)
+
+            elif state == "awaiting_student_reg":
+                reg_no = text.upper()
+                balance_msg = get_student_balance_by_reg(reg_no)
+                send_text_message(phone, balance_msg)
+                USER_STATES[phone] = "main_menu"  # Return to main menu
+
+            else:
+                USER_STATES.pop(phone, None)
+                send_text_message(phone, "Session reset. Please send any message to start again.")
+
+        except Exception as e:
+            print("Webhook error:", e)
+
+        return JsonResponse({"status": "received"}, status=200)
+
+
+def get_main_menu(role):
+    if role == "staff":
+        return (
+            "👨‍🏫 *Staff Menu:*\n"
+            "1. View Student Fees Balance\n"
+            "2. Fees Statement PDF\n"
+            "3. Bank Account Details\n"
+            "4. Debtors Report PDF\n"
+            "5. View Announcements"
+        )
+    else:
+        return (
+            "👨‍👩‍👧 *BeezParent Menu:*\n"
+            "1. Fees Balance\n"
+            # "2. Statement PDF\n"
+            "3. Bank Account Details"
+        )
+
+
+def handle_menu_selection(role, message, phone):
+    if message == "1" and role == "parent":
+        try:
+            # Get all children associated with this parent's phone number
+            children = lbt_customer.objects.filter(col_mobi_num=phone)
+            
+            if not children.exists():
+                return "⚠️ No students found associated with your number. Please contact the office."
+            
+            response = "💰 Fees Balances:\n\n"
+            for child in children:
+                balance_record = account_balances.objects.filter(col_cust_no=child.col_cust_no).first()
+                if balance_record:
+                    response += f"{child.col_firstname} {child.col_lastname} [{child.col_cust_no}]:  ${balance_record.balance} USD\n"
+                else:
+                    response += f"{child.col_firstname} {child.col_lastname} [{child.col_cust_no}]: Balance record not found\n"
+            
+            return response
+            
+        except Exception as e:
+            print("Parent balance error:", e)
+            return "⚠️ Could not retrieve balances. Please contact the office."
+
+    elif message == "2":
+        return "📄 Statement PDF: https://statement.com/statement.pdf"
+
+    elif message == "3":
+        return BANK_DETAILS
+
+    elif message == "4" and role == "staff":
+        return "📄 Debtors PDF: https://debtor.com/debtors.pdf"
+
+    elif message == "5" and role == "staff":
+        return "📢 Announcement: School reopens on Monday."
+
+    else:
+        return "❓ Invalid selection. Please choose a number from the menu."
+
+
+def get_student_balance_by_reg(reg_no):
+    try:
+        customer = lbt_customer.objects.get(col_cust_no=reg_no)
+        balance_record = account_balances.objects.filter(col_cust_no=reg_no).first()
+        if balance_record:
+            return f"📌 Balance for {customer.col_firstname} {customer.col_lastname}  [{reg_no}]: USD {balance_record.balance}"
+        else:
+            return f"⚠️ No balance record found for student {reg_no}."
+    except lbt_customer.DoesNotExist:
+        return "❌ Student registration number not found. Please check and try again."
+    except Exception as e:
+        print("Staff balance lookup error:", e)
+        return "⚠️ Error retrieving balance. Please try again later."
