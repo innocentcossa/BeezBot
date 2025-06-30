@@ -1,14 +1,18 @@
 from django.http import JsonResponse, HttpResponseForbidden, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 import json
-from io import BytesIO
-from django.template.loader import render_to_string
-from weasyprint import HTML
 
 from .send_api import (
     send_text_message,
     send_document_message,
     upload_pdf_to_whatsapp
+)
+
+from .pdf_generator import (
+    generate_fee_statement_pdf_html,
+    generate_student_fee_statement_pdf_html,
+    generate_debtors_report_pdf_html,
+    generate_fees_statement_whatsapp_pdf  
 )
 
 from bot.models import lbt_customer, account_balances, lbt_stuff, BankDetail
@@ -28,79 +32,6 @@ def get_bank_details():
         f"🏢 Branch: {bank.branch}\n\n"
         "📌 Please use the student's name and reg number as reference."
     )
-
-
-def generate_fee_statement_pdf_html(phone):
-    students = lbt_customer.objects.filter(col_mobi_num=phone)
-    if not students.exists():
-        html_string = "<h1>No student data found.</h1>"
-    else:
-        student = students.first()
-        balance_record = account_balances.objects.filter(col_cust_no=student.col_cust_no).first()
-        balance = balance_record.balance if balance_record else "Not Available"
-        context = {
-            "student_name": f"{student.col_firstname} {student.col_lastname}",
-            "reg_no": student.col_cust_no,
-            "balance": balance,
-            "multiple": students.count() > 1,
-            "all_students": [
-                {
-                    "name": f"{s.col_firstname} {s.col_lastname}",
-                    "reg_no": s.col_cust_no,
-                    "balance": account_balances.objects.filter(col_cust_no=s.col_cust_no).first().balance if account_balances.objects.filter(col_cust_no=s.col_cust_no).exists() else "Not Available"
-                }
-                for s in students
-            ]
-        }
-        html_string = render_to_string("fee_statement.html", context)
-
-    pdf_file = BytesIO()
-    HTML(string=html_string).write_pdf(pdf_file)
-    pdf_file.seek(0)
-    return pdf_file
-
-
-def generate_student_fee_statement_pdf_html(reg_no):
-    try:
-        student = lbt_customer.objects.get(col_cust_no=reg_no)
-        balance_record = account_balances.objects.filter(col_cust_no=reg_no).first()
-        balance = balance_record.balance if balance_record else "Not Available"
-        context = {
-            "student_name": f"{student.col_firstname} {student.col_lastname}",
-            "reg_no": student.col_cust_no,
-            "balance": balance,
-        }
-        html_string = render_to_string("student_fee_statement.html", context)
-    except lbt_customer.DoesNotExist:
-        html_string = "<h1>❌ Student not found.</h1>"
-
-    pdf_file = BytesIO()
-    HTML(string=html_string).write_pdf(pdf_file)
-    pdf_file.seek(0)
-    return pdf_file
-
-
-def generate_debtors_report_pdf_html():
-    students_with_balance = account_balances.objects.filter(balance__gt=0)
-    debtors = []
-    for record in students_with_balance:
-        try:
-            student = lbt_customer.objects.get(col_cust_no=record.col_cust_no)
-            debtors.append({
-                "name": f"{student.col_firstname} {student.col_lastname}",
-                "reg_no": student.col_cust_no,
-                "balance": float(record.balance),
-            })
-        except lbt_customer.DoesNotExist:
-            continue
-
-    context = {"debtors": debtors}
-    html_string = render_to_string("debtors_report.html", context)
-
-    pdf_file = BytesIO()
-    HTML(string=html_string).write_pdf(pdf_file)
-    pdf_file.seek(0)
-    return pdf_file
 
 
 @csrf_exempt
@@ -199,12 +130,15 @@ def webhook(request):
 
             if state == "awaiting_statement_reg":
                 reg_no = text.upper()
-                pdf_buffer = generate_student_fee_statement_pdf_html(reg_no)
-                media_id = upload_pdf_to_whatsapp(pdf_buffer, filename=f"{reg_no}_Statement.pdf")
-                if media_id:
-                    send_document_message(phone, media_id, caption=f"📄 Fee Statement for {reg_no}")
+                pdf_buffer = generate_fees_statement_whatsapp_pdf(reg_no)  # Updated to use new function with logo
+                if pdf_buffer:
+                    media_id = upload_pdf_to_whatsapp(pdf_buffer, filename=f"{reg_no}_Statement.pdf")
+                    if media_id:
+                        send_document_message(phone, media_id, caption=f"📄 Fee Statement for {reg_no}")
+                    else:
+                        send_text_message(phone, "❌ Could not upload statement.")
                 else:
-                    send_text_message(phone, "❌ Could not upload statement.")
+                    send_text_message(phone, "❌ Could not generate statement PDF.")
                 USER_STATES[phone] = "main_menu"
                 return JsonResponse({"status": "statement sent"}, status=200)
 
@@ -304,3 +238,4 @@ def get_student_balance_by_reg(reg_no):
     except Exception as e:
         print("Staff balance lookup error:", e)
         return "⚠️ Error retrieving balance. Please try again later."
+
